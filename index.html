@@ -347,73 +347,82 @@ function fR(n){ return Number(n).toLocaleString('pt-BR',{minimumFractionDigits:2
 function el(id){ return document.getElementById(id); }
 
 // ── GOOGLE SHEETS LOADER ──
-function csvToArray(csv) {
+function csvParse(csv) {
   var rows = [], cur = '', inQ = false, row = [];
-  for (var i=0; i<csv.length; i++) {
+  for (var i = 0; i < csv.length; i++) {
     var ch = csv[i];
-    if (ch === '"') { inQ = !inQ; }
-    else if (ch === ',' && !inQ) { row.push(cur.trim().replace(/^"|"$/g,'')); cur = ''; }
-    else if ((ch === '\n' || ch === '\r') && !inQ) {
-      if (cur || row.length) { row.push(cur.trim().replace(/^"|"$/g,'')); rows.push(row); }
-      cur = ''; row = [];
+    if (ch === '"') { inQ = !inQ; continue; }
+    if (ch === ',' && !inQ) { row.push(cur.trim()); cur = ''; continue; }
+    if ((ch === '\n' || ch === '\r') && !inQ) {
+      row.push(cur.trim()); cur = '';
+      if (row.some(function(c){return c!=='';})) rows.push(row);
+      row = [];
       if (ch === '\r' && csv[i+1] === '\n') i++;
-    } else { cur += ch; }
+      continue;
+    }
+    cur += ch;
   }
-  if (cur || row.length) { row.push(cur.trim().replace(/^"|"$/g,'')); rows.push(row); }
+  if (cur || row.length) { row.push(cur.trim()); if (row.some(function(c){return c!==''';})) rows.push(row); }
   return rows;
 }
 
-function parseSheet(csvText, grupo) {
-  var rows = csvToArray(csvText);
+// Map grupo names from sheet to display names
+var GRUPO_MAP = {
+  'CHAPA':            'Chapas',
+  'LAMINADO':         'Laminados',
+  'VIGA':             'Vigas e Perfis',
+  'TUBO AÇO CARBONO': 'Tubos Aço Carbono',
+  'TUBO INOX 304':    'Tubos Inox 304',
+  'TUBO INOX 316':    'Tubos Inox 316'
+};
+
+function parseResumo(csv) {
+  var rows = csvParse(csv);
   var items = [];
+  var id = 1;
 
-  // Row index 6 (0-based) = supplier names row
-  var suppRow = rows[6] || [];
-  var suppliers = [];
-  for (var col=6; col<46; col+=5) {
-    var v = suppRow[col];
-    if (v && v.indexOf('FORNECEDOR') < 0 && v.trim() !== '') {
-      suppliers.push({col:col, nome:v.trim()});
-    }
-  }
-
-  for (var r=8; r<rows.length; r++) {
+  for (var r = 0; r < rows.length; r++) {
     var row = rows[r];
-    if (!row || !row[0]) continue;
-    var num = parseInt(row[0]); if (isNaN(num)) continue;
-    var desc = (row[1]||'').trim();
-    var un   = (row[3]||'').trim();
-    var mp   = parseFloat((row[4]||'0').replace(',','.')) || 0;
-    var fv   = (row[5]||'').trim();
-    var fors = [];
-    suppliers.forEach(function(s) {
-      var vu = parseFloat(((row[s.col]||'').replace(',','.')));
-      if (isNaN(vu)) return;
-      var ipi  = parseFloat(((row[s.col+1]||'0').replace(',','.'))) || 0;
-      var vt   = parseFloat(((row[s.col+2]||'0').replace(',','.'))) || 0;
-      var prazo= (row[s.col+3]||'').trim();
-      var frete= (row[s.col+4]||'').trim();
-      fors.push({nome:s.nome, v_unit:vu, ipi:ipi, v_total:vt, prazo:prazo, frete:frete});
-    });
-    var winner = fors.filter(function(f){return f.nome===fv;})[0];
+    // Must have at least 7 columns and first column must be a number
+    if (!row || row.length < 6) continue;
+    var num = parseInt(row[0]);
+    if (isNaN(num)) continue;
+
+    var grupoRaw = (row[1] || '').trim().toUpperCase();
+    var grupo    = GRUPO_MAP[grupoRaw] || grupoRaw;
+    var descricao = (row[2] || '').trim();
+    var un        = (row[4] || '').trim();
+    
+    // Price: remove "R$ " and dots, replace comma with dot
+    var precoStr = (row[5] || '0').trim()
+      .replace('R$', '').replace(/\s/g, '')
+      .replace(/\./g, '').replace(',', '.');
+    var preco = parseFloat(precoStr) || 0;
+    var forn  = (row[6] || '').trim();
+
+    if (!descricao || !grupo) continue;
+
     items.push({
-      id: 0, grupo:grupo, num:num, descricao:desc, un:un,
-      menor_preco_unit:mp, fornecedor_vencedor:fv,
-      prazo_vencedor: winner?winner.prazo:'',
-      frete_vencedor: winner?winner.frete:'',
-      fornecedores:fors
+      id: id++,
+      grupo: grupo,
+      num: num,
+      descricao: descricao,
+      un: un,
+      menor_preco_unit: preco,
+      fornecedor_vencedor: forn,
+      prazo_vencedor: '',
+      frete_vencedor: '',
+      fornecedores: [{
+        nome: forn,
+        v_unit: preco,
+        ipi: 0,
+        v_total: preco,
+        prazo: '',
+        frete: ''
+      }]
     });
   }
   return items;
-}
-
-function fetchSheet(sheetName) {
-  var url = 'https://docs.google.com/spreadsheets/d/' + SHEET_ID +
-            '/gviz/tq?sheet=' + encodeURIComponent(sheetName) + '&tqx=out:csv';
-  return fetch(url).then(function(r){
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.text();
-  });
 }
 
 function setLoad(pct, msg) {
@@ -422,49 +431,64 @@ function setLoad(pct, msg) {
 }
 
 function loadAllSheets() {
-  var sheets = Object.keys(SHEET_MAP);
-  var allItems = [];
-  var idx = 0;
-
-  function next() {
-    if (idx >= sheets.length) {
-      // Assign sequential IDs
-      allItems.forEach(function(item,i){ item.id = i+1; });
-      DB = allItems;
+  setLoad(20, 'Conectando ao Google Sheets...');
+  var url = 'https://docs.google.com/spreadsheets/d/' + SHEET_ID +
+            '/gviz/tq?sheet=RESUMO&tqx=out:csv';
+  fetch(url)
+    .then(function(r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status + ' — verifique se a planilha está pública.');
+      setLoad(60, 'Lendo dados...');
+      return r.text();
+    })
+    .then(function(csv) {
+      setLoad(85, 'Processando...');
+      var items = parseResumo(csv);
+      if (!items.length) throw new Error('Nenhum dado encontrado na aba RESUMO.');
+      items.forEach(function(item, i) { item.id = i + 1; });
+      DB = items;
       setLoad(100, 'Carregado! ' + DB.length + ' materiais.');
-      setTimeout(function(){
+      setTimeout(function() {
         el('loadScreen').style.display = 'none';
         onDataReady();
       }, 400);
-      return;
-    }
-    var sheet = sheets[idx];
-    var grupo = SHEET_MAP[sheet];
-    setLoad(Math.round((idx/sheets.length)*90), 'Carregando ' + grupo + '...');
-    fetchSheet(sheet)
-      .then(function(csv){
-        var items = parseSheet(csv, grupo);
-        allItems = allItems.concat(items);
-        idx++;
-        next();
-      })
-      .catch(function(err){
-        el('loadStatus').innerHTML = '<div class="load-error">❌ Erro ao carregar <strong>' + grupo + '</strong>.<br>' +
-          'Verifique se a planilha está pública.<br><small>' + err.message + '</small><br><br>' +
-          '<button class="btn b-ac" onclick="location.reload()" style="margin-top:8px">Tentar novamente</button></div>';
-      });
-  }
-  next();
+    })
+    .catch(function(err) {
+      el('loadStatus').innerHTML = '';
+      el('loadScreen').querySelector('.load-error') && null;
+      var errDiv = document.createElement('div');
+      errDiv.className = 'load-error';
+      errDiv.innerHTML = '❌ Erro ao carregar dados.<br>' + err.message +
+        '<br><br><button class="btn b-ac" onclick="location.reload()" style="margin-top:8px">Tentar novamente</button>';
+      el('loadScreen').appendChild(errDiv);
+    });
 }
 
-function onDataReady() {
-  el('hDate').textContent = new Date().toLocaleDateString('pt-BR');
-  el('hTotal').textContent = DB.length + ' ITENS';
-  buildDash();
-  buildRankTable();
-  renderTable(DB);
-  initNav();
-  initEvents();
+function syncData() {
+  el('statusDot').className = 'dot orange';
+  el('statusTxt').textContent = 'SINCRONIZANDO...';
+  el('statusTxt').style.color = 'var(--gd)';
+  rkBuilt = false;
+  var url = 'https://docs.google.com/spreadsheets/d/' + SHEET_ID +
+            '/gviz/tq?sheet=RESUMO&tqx=out:csv';
+  fetch(url)
+    .then(function(r) { return r.text(); })
+    .then(function(csv) {
+      var items = parseResumo(csv);
+      items.forEach(function(item, i) { item.id = i + 1; });
+      DB = items;
+      el('hTotal').textContent = DB.length + ' ITENS';
+      el('statusDot').className = 'dot green';
+      el('statusTxt').textContent = 'SINCRONIZADO — ' + DB.length + ' itens';
+      el('statusTxt').style.color = 'var(--gr)';
+      buildDash(); buildRankTable(); renderTable(DB);
+      setTimeout(function() { el('statusTxt').textContent = 'ONLINE'; }, 3000);
+    })
+    .catch(function() {
+      el('statusDot').className = 'dot';
+      el('statusDot').style.background = 'var(--rd)';
+      el('statusTxt').textContent = 'ERRO AO SINCRONIZAR';
+      el('statusTxt').style.color = 'var(--rd)';
+    });
 }
 
 // ── NAV ──
